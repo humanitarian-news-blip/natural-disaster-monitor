@@ -1,0 +1,39 @@
+name: Natural Disaster Monitor
+
+on:
+  schedule:
+    - cron: "0 5 * * *"   # 9:00 AM UAE time
+    - cron: "0 15 * * *"  # 7:00 PM UAE time
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  run-disaster-report:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run disaster monitor
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: python main.py
+
+      - name: Commit generated report
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add reports/
+          git commit -m "Add latest disaster report" || echo "No changes to commit"
+          git push
