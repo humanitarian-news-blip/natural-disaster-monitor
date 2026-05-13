@@ -1,0 +1,198 @@
+import os
+import json
+import feedparser
+import requests
+from datetime import datetime, timezone, timedelta
+from dateutil import parser as dateparser
+from openai import OpenAI
+
+OPENAI_API_KEY = os.environ["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"]
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+NOW = datetime.now(timezone.utc)
+CUTOFF = NOW - timedelta(hours=48)
+
+
+SYSTEM_PROMPT = """
+You are a humanitarian disaster monitoring assistant.
+
+Provide verified natural disaster events occurring within the past 48 hours only,
+including storms, earthquakes, floods, volcanic eruptions, wildfires, landslides and droughts.
+
+Prioritize official alerts and reliable sources such as:
+- GDACS
+- ReliefWeb
+- EMSC
+- NOAA
+- NASA Earth Observatory
+- national meteorological agencies
+- reliable breaking-news outlets
+
+Wikipedia is prohibited.
+
+Provide a concise, factual global summary highlighting:
+- Type of disaster
+- Location and severity
+- Human impact: casualties, evacuations, affected population
+- Ongoing risks or forecasts
+
+Also include a section titled "Retrospective Updates" for verified follow-up reports
+such as revised casualty counts or ongoing rescue updates, even if the disaster started earlier.
+
+End with a short section titled "Current Outlook" summarizing potential developing threats
+for the next 48 hours.
+
+Use dates clearly. Do not include unverified events.
+"""
+
+
+def fetch_gdacs():
+    url = "https://www.gdacs.org/contentdata/xml/rss_48h.xml"
+    feed = feedparser.parse(url)
+
+    items = []
+    for entry in feed.entries:
+        published = None
+
+        if hasattr(entry, "published"):
+            try:
+                published = dateparser.parse(entry.published)
+            except Exception:
+                published = None
+
+        if published and published.tzinfo is None:
+            published = published.replace(tzinfo=timezone.utc)
+
+        if published and published < CUTOFF:
+            continue
+
+        items.append({
+            "source": "GDACS",
+            "title": entry.get("title", ""),
+            "published": entry.get("published", ""),
+            "summary": entry.get("summary", ""),
+            "link": entry.get("link", "")
+        })
+
+    return items
+
+
+def fetch_reliefweb():
+    url = "https://api.reliefweb.int/v1/reports"
+
+    payload = {
+        "appname": "natural-disaster-monitor",
+        "limit": 20,
+        "sort": ["date:desc"],
+        "filter": {
+            "operator": "AND",
+            "conditions": [
+                {
+                    "field": "date.created",
+                    "value": {
+                        "from": CUTOFF.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+                        "to": NOW.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+                    }
+                },
+                {
+                    "field": "disaster_type.name",
+                    "value": [
+                        "Flood",
+                        "Flash Flood",
+                        "Storm",
+                        "Tropical Cyclone",
+                        "Earthquake",
+                        "Volcano",
+                        "Wild Fire",
+                        "Land Slide",
+                        "Drought"
+                    ]
+                }
+            ]
+        },
+        "fields": {
+            "include": [
+                "title",
+                "date.created",
+                "source.name",
+                "country.name",
+                "disaster_type.name",
+                "url",
+                "body"
+            ]
+        }
+    }
+
+    response = requests.post(url, json=payload, timeout=30)
+    response.raise_for_status()
+
+    data = response.json()
+
+    items = []
+    for item in data.get("data", []):
+        fields = item.get("fields", {})
+        items.append({
+            "source": "ReliefWeb",
+            "title": fields.get("title", ""),
+            "published": fields.get("date", {}).get("created", ""),
+            "source_name": ", ".join(fields.get("source", [{}])[0].get("name", "") for _ in [0]) if fields.get("source") else "",
+            "country": [c.get("name", "") for c in fields.get("country", [])],
+            "disaster_type": [d.get("name", "") for d in fields.get("disaster_type", [])],
+            "url": fields.get("url", ""),
+            "body": fields.get("body", "")[:2500]
+        })
+
+    return items
+
+
+def generate_report(disaster_data):
+    user_content = f"""
+Current UTC time: {NOW.isoformat()}
+
+Use only the verified information below.
+Filter to the past 48 hours where possible.
+Separate retrospective updates clearly.
+
+DATA:
+{json.dumps(disaster_data, indent=2, ensure_ascii=False)}
+"""
+
+    response = client.responses.create(
+        model="gpt-4.1",
+        input=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_content}
+        ]
+    )
+
+    return response.output_text
+
+
+def save_report(report):
+    os.makedirs("reports", exist_ok=True)
+
+    filename = f"reports/disaster-update-{NOW.strftime('%Y-%m-%d-%H%M')}.md"
+
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(report)
+
+    print(report)
+    print(f"\nSaved report to {filename}")
+
+
+def main():
+    gdacs_items = fetch_gdacs()
+    reliefweb_items = fetch_reliefweb()
+
+    disaster_data = {
+        "gdacs": gdacs_items,
+        "reliefweb": reliefweb_items
+    }
+
+    report = generate_report(disaster_data)
+    save_report(report)
+
+
+if __name__ == "__main__":
+    main()
